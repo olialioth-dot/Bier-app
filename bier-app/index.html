@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BierDeal – Bier Preisvergleich</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #f8f7f4; }
+    .beer-card { transition: transform 0.15s; }
+    .beer-card:hover { transform: translateY(-2px); }
+    .badge-coop   { background: #e8f5e9; color: #2e7d32; }
+    .badge-denner { background: #fce4ec; color: #c62828; }
+    .heart-active { color: #ef4444; fill: #ef4444; }
+    @keyframes slide-in  { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes slide-out { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+    .toast-in  { animation: slide-in  0.3s ease forwards; }
+    .toast-out { animation: slide-out 0.3s ease forwards; }
+    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
+
+const API_URL = 'http://localhost:3001';
+// ← Trage hier deine Google OAuth Client-ID ein (console.cloud.google.com)
+const GOOGLE_CLIENT_ID = 'DEINE_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+const WS_URL  = 'ws://localhost:3001';
+const BEER_TYPES = ['Alle', 'Lager', 'Pilsner', 'Weizen', 'Ale', 'Stout'];
+const SHOPS      = ['Alle', 'Coop', 'Denner'];
+const STORE_COUNTS = { Coop: 1312, Denner: 1163 };
+
+function pct(p, o) { return o && o > p ? Math.round((1 - p / o) * 100) : 0; }
+
+function literpreis(price, volume) {
+  if (!volume || !price) return null;
+  let m = volume.match(/(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*cl/i);
+  if (m) {
+    const total = parseInt(m[1]) * parseFloat(m[2].replace(',', '.')) / 100;
+    return total > 0 ? price / total : null;
+  }
+  m = volume.match(/(\d+(?:[.,]\d+)?)\s*cl/i);
+  if (m) {
+    const liters = parseFloat(m[1].replace(',', '.')) / 100;
+    return liters > 0 ? price / liters : null;
+  }
+  return null;
+}
+
+// ─── Affiliate Link Generator ─────────────────────────────────────────────────
+const AFFILIATE_IDS = {
+  Coop:   'deine-echte-coop-id',    // ← von Tradedoubler
+  Denner: 'deine-echte-denner-id',  // ← von Awin
+};
+
+function getAffiliateUrl(beer) {
+  const tag = AFFILIATE_IDS[beer.shop];
+  if (!tag) return null;
+  if (beer.shop === 'Coop') {
+    const query = encodeURIComponent(beer.name);
+    return `https://www.coop.ch/de/search?text=${query}&utm_source=bierdeal&utm_medium=affiliate&utm_campaign=${tag}`;
+  }
+  if (beer.shop === 'Denner') {
+    const query = encodeURIComponent(beer.name);
+    return `https://www.denner.ch/de/suche?q=${query}&ref=${tag}&utm_source=bierdeal`;
+  }
+  return null;
+}
+
+// ─── WebSocket hook ──────────────────────────────────────────────────────────
+function useWebSocket(url) {
+  const [beers,    setBeers]    = useState([]);
+  const [alarms,   setAlarms]   = useState([]);
+  const [status,   setStatus]   = useState('connecting');
+  const [toasts,   setToasts]   = useState([]);
+  const [lastSync, setLastSync] = useState(null);
+  const wsRef    = useRef(null);
+  const retryRef = useRef(null);
+
+  const addToast = useCallback((alarm) => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, alarm }]);
+    setTimeout(() => setToasts(prev => prev.map(t => t.id === id ? { ...t, exiting: true } : t)), 4000);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4400);
+  }, []);
+
+  const send = useCallback((msg) => {
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify(msg));
+    }
+  }, []);
+
+  useEffect(() => {
+    function connect() {
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setStatus('connected');
+        clearTimeout(retryRef.current);
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        switch (msg.type) {
+          case 'init':
+          case 'update':
+            if (msg.beers)  setBeers(msg.beers);
+            if (msg.alarms) setAlarms(msg.alarms);
+            if (msg.timestamp) setLastSync(new Date(msg.timestamp));
+            break;
+          case 'alarm_added':
+            setAlarms(prev => [...prev.filter(a => a.id !== msg.alarm.id), msg.alarm]);
+            break;
+          case 'alarm_removed':
+            setAlarms(prev => prev.filter(a => a.id !== msg.alarm_id));
+            break;
+          case 'alarm_triggered':
+            addToast(msg.alarm);
+            setAlarms(prev => prev.map(a =>
+              a.id === msg.alarm.id ? { ...a, notified: 1 } : a
+            ));
+            break;
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus('disconnected');
+        retryRef.current = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => ws.close();
+    }
+
+    connect();
+    return () => {
+      clearTimeout(retryRef.current);
+      wsRef.current?.close();
+    };
+  }, [url, addToast]);
+
+  const addAlarm    = (beer_id, target_price) => send({ type: 'add_alarm', beer_id, target_price });
+  const removeAlarm = (alarm_id)              => send({ type: 'remove_alarm', alarm_id });
+  const refresh     = ()                      => send({ type: 'refresh' });
+
+  return { beers, alarms, status, toasts, lastSync, addAlarm, removeAlarm, refresh };
+}
+
+// ─── Auth Modal ──────────────────────────────────────────────────────────────
+function AuthModal({ onClose, onLogin }) {
+  const [activeTab, setActiveTab] = useState('login');
+  const [loginEmail,    setLoginEmail]    = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError,    setLoginError]    = useState('');
+  const [loginLoading,  setLoginLoading]  = useState(false);
+
+  const [regUsername, setRegUsername] = useState('');
+  const [regEmail,    setRegEmail]    = useState('');
+  const [regPassword, setRegPassword] = useState('');
+  const [regError,    setRegError]    = useState('');
+  const [regLoading,  setRegLoading]  = useState(false);
+
+  const [googleError,   setGoogleError]   = useState('');
+  const googleBtnRef = useRef(null);
+
+  function handleGoogleCredential(response) {
+    setGoogleError('');
+    fetch(API_URL + '/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential: response.credential })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) throw new Error(data.error);
+        localStorage.setItem('bierdeal_token', data.token);
+        onLogin(data.token, data.user);
+        onClose();
+      })
+      .catch(function(err) { setGoogleError(err.message || 'Google-Anmeldung fehlgeschlagen'); });
+  }
+
+  useEffect(function() {
+    if (!window.google || !googleBtnRef.current) return;
+    try {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleCredential,
+      });
+      googleBtnRef.current.innerHTML = '';
+      window.google.accounts.id.renderButton(googleBtnRef.current, {
+        theme: 'outline', size: 'large', width: 320,
+        text: 'signin_with', shape: 'rectangular', locale: 'de',
+      });
+    } catch(e) { console.warn('[Google]', e.message); }
+  }, []);
+
+  function handleLogin(e) {
+    e.preventDefault();
+    setLoginError('');
+    setLoginLoading(true);
+    fetch(API_URL + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: loginEmail, password: loginPassword })
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) throw new Error(data.error);
+        localStorage.setItem('bierdeal_token', data.token);
+        onLogin(data.token, data.user);
+        onClose();
+      })
+      .catch(err => setLoginError(err.message || 'Anmeldung fehlgeschlagen'))
+      .finally(() => setLoginLoading(false));
+  }
+
+  function handleRegister(e) {
+    e.preventDefault();
+    setRegError('');
+    setRegLoading(true);
+    fetch(API_URL + '/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: regUsername, email: regEmail, password: regPassword })
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) throw new Error(data.error);
+        localStorage.setItem('bierdeal_token', data.token);
+        onLogin(data.token, data.user);
+        onClose();
+      })
+      .catch(err => setRegError(err.message || 'Registrierung fehlgeschlagen'))
+      .finally(() => setRegLoading(false));
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+         onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-white rounded-3xl w-full max-w-sm shadow-2xl overflow-hidden">
+        {/* Header */}
+        <div className="bg-amber-500 px-6 pt-6 pb-4">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-white font-black text-xl">🍺 BierDeal</h2>
+            <button onClick={onClose}
+                    className="p-1.5 rounded-xl bg-white/20 text-white hover:bg-white/30">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M18 6 6 18M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          {/* Tabs */}
+          <div className="flex gap-1 bg-white/20 rounded-2xl p-1">
+            <button onClick={() => setActiveTab('login')}
+                    className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-colors ${activeTab === 'login' ? 'bg-white text-amber-600' : 'text-white hover:bg-white/10'}`}>
+              Anmelden
+            </button>
+            <button onClick={() => setActiveTab('register')}
+                    className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-colors ${activeTab === 'register' ? 'bg-white text-amber-600' : 'text-white hover:bg-white/10'}`}>
+              Registrieren
+            </button>
+          </div>
+        </div>
+
+        {/* Login form */}
+        {activeTab === 'login' && (
+          <form onSubmit={handleLogin} className="p-6 flex flex-col gap-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">E-Mail</label>
+              <input type="email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)}
+                     placeholder="name@beispiel.ch"
+                     required
+                     className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Passwort</label>
+              <input type="password" value={loginPassword} onChange={e => setLoginPassword(e.target.value)}
+                     placeholder="••••••••"
+                     required
+                     className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            </div>
+            {loginError && <p className="text-xs text-red-500 font-medium">{loginError}</p>}
+            <button type="submit"
+                    disabled={loginLoading}
+                    className="mt-1 py-3 bg-amber-500 text-white font-bold rounded-2xl hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {loginLoading ? 'Anmelden…' : 'Anmelden'}
+            </button>
+          </form>
+        )}
+
+        {/* Register form */}
+        {activeTab === 'register' && (
+          <form onSubmit={handleRegister} className="p-6 flex flex-col gap-3">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Benutzername</label>
+              <input type="text" value={regUsername} onChange={e => setRegUsername(e.target.value)}
+                     placeholder="bierfreund42"
+                     required
+                     className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">E-Mail</label>
+              <input type="email" value={regEmail} onChange={e => setRegEmail(e.target.value)}
+                     placeholder="name@beispiel.ch"
+                     required
+                     className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Passwort</label>
+              <input type="password" value={regPassword} onChange={e => setRegPassword(e.target.value)}
+                     placeholder="••••••••"
+                     required
+                     className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            </div>
+            {regError && <p className="text-xs text-red-500 font-medium">{regError}</p>}
+            <button type="submit"
+                    disabled={regLoading}
+                    className="mt-1 py-3 bg-amber-500 text-white font-bold rounded-2xl hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {regLoading ? 'Registrieren…' : 'Konto erstellen'}
+            </button>
+          </form>
+        )}
+
+        {/* Google Sign-In */}
+        <div className="px-6 pb-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="flex-1 h-px bg-gray-200" />
+            <span className="text-xs text-gray-400 font-medium">oder</span>
+            <div className="flex-1 h-px bg-gray-200" />
+          </div>
+          {googleError && <p className="text-xs text-red-500 font-medium mb-2">{googleError}</p>}
+          <div ref={googleBtnRef} className="flex justify-center" />
+          {GOOGLE_CLIENT_ID === 'DEINE_GOOGLE_CLIENT_ID.apps.googleusercontent.com' && (
+            <p className="text-xs text-gray-400 text-center mt-2">
+              ⚙️ Google Client-ID noch nicht konfiguriert
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Small components ────────────────────────────────────────────────────────
+function HeartBtn({ active, loggedIn, onClick }) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div className="relative" onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}>
+      <button onClick={onClick} className="p-1 rounded-full hover:bg-red-50 transition-colors">
+        <svg className={`w-5 h-5 transition-colors ${active ? 'heart-active' : 'text-gray-300'}`}
+             fill={active ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+          <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+        </svg>
+      </button>
+      {!loggedIn && hovered && (
+        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 whitespace-nowrap bg-gray-800 text-white text-xs rounded-lg px-2 py-1 pointer-events-none z-10">
+          🔒 Login zum Speichern
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BellBtn({ active, onClick }) {
+  return (
+    <button onClick={onClick} className="p-1 rounded-full hover:bg-amber-50 transition-colors">
+      <svg className={`w-5 h-5 ${active ? 'text-amber-500' : 'text-gray-300'}`}
+           fill={active ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/>
+      </svg>
+    </button>
+  );
+}
+
+function StatusDot({ status }) {
+  const color = status === 'connected' ? 'bg-green-400' : status === 'connecting' ? 'bg-amber-400 pulse-dot' : 'bg-red-400';
+  const label = status === 'connected' ? 'Live' : status === 'connecting' ? 'Verbinde…' : 'Offline';
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className={`w-2 h-2 rounded-full ${color}`} />
+      <span className="text-xs text-amber-100">{label}</span>
+    </div>
+  );
+}
+
+function BeerCard({ beer, isFav, alarm, loggedIn, onToggleFav, onOpenAlarm, onOpenLocator }) {
+  const disc       = beer.discount_pct ?? pct(beer.price, beer.orig_price);
+  const lp         = literpreis(beer.price, beer.volume);
+  const storeCount = STORE_COUNTS[beer.shop] || null;
+  const affUrl     = getAffiliateUrl(beer);
+
+  return (
+    <div className="beer-card bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex gap-3 cursor-pointer"
+         onClick={() => onOpenLocator && onOpenLocator(beer)}>
+
+      {/* Bild */}
+      <div className="text-3xl flex items-center justify-center w-14 h-14 bg-amber-50 rounded-xl flex-shrink-0">
+        {beer.img
+          ? <img src={beer.img} alt={beer.name} className="w-full h-full object-contain rounded-xl"
+                 onError={e => { e.target.style.display='none'; e.target.nextSibling.style.display='flex'; }} />
+          : null}
+        <span style={{display: beer.img ? 'none' : 'flex'}}>🍺</span>
+      </div>
+
+      {/* Inhalt */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-start justify-between gap-1">
+          <div className="min-w-0">
+            <p className="text-xs text-gray-400 truncate">{beer.brand}</p>
+            <h3 className="font-semibold text-gray-800 text-sm leading-tight">{beer.name}</h3>
+            <div className="flex gap-1 mt-1 flex-wrap">
+              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${beer.shop === 'Coop' ? 'badge-coop' : 'badge-denner'}`}>
+                {beer.shop}
+              </span>
+              {beer.type   && <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">{beer.type}</span>}
+              {beer.volume && <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">{beer.volume}</span>}
+            </div>
+          </div>
+          <div className="flex gap-0.5 flex-shrink-0" onClick={e => e.stopPropagation()}>
+            <HeartBtn active={isFav} loggedIn={loggedIn} onClick={onToggleFav} />
+            <BellBtn  active={!!alarm} onClick={onOpenAlarm} />
+          </div>
+        </div>
+
+        {/* Preis */}
+        <div className="flex items-center gap-2 mt-2 flex-wrap">
+          <span className="text-lg font-bold text-amber-600">CHF {beer.price.toFixed(2)}</span>
+          {beer.orig_price > beer.price && (
+            <span className="text-xs text-gray-400 line-through">CHF {beer.orig_price.toFixed(2)}</span>
+          )}
+          {disc > 0 && <span className="text-xs font-bold text-green-600 bg-green-50 px-2 py-0.5 rounded-full">-{disc}%</span>}
+          {lp && <span className="text-xs text-gray-400 bg-gray-50 px-2 py-0.5 rounded-full">CHF {lp.toFixed(2)}/L</span>}
+        </div>
+
+        {/* Filiale finden */}
+        <div className="flex items-center gap-1 mt-2">
+          <svg className="w-3 h-3 text-gray-300" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+          </svg>
+          <span className="text-xs text-gray-300">Filiale finden</span>
+          {storeCount && (
+            <span className="text-xs text-gray-300 ml-1">· 📍 {storeCount.toLocaleString('de-CH')} Filialen</span>
+          )}
+        </div>
+
+        {/* Affiliate-Button */}
+        {affUrl && (
+          <a href={affUrl}
+             target="_blank"
+             rel="noopener noreferrer sponsored"
+             onClick={e => e.stopPropagation()}
+             className="mt-2 flex items-center justify-center gap-1.5 w-full py-1.5 rounded-xl
+                        bg-amber-50 hover:bg-amber-100 text-amber-600 text-xs font-semibold
+                        transition-colors border border-amber-100">
+            🛒 Online kaufen bei {beer.shop}
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/>
+            </svg>
+          </a>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// ─── Store Locator Modal ─────────────────────────────────────────────────────
+function StoreLocator({ beer, onClose }) {
+  const [plz,     setPlz]     = useState('');
+  const [radius,  setRadius]  = useState(20);
+  const [stores,  setStores]  = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState(null);
+
+  function search() {
+    if (plz.length !== 4) return;
+    setLoading(true); setError(null); setStores(null);
+    fetch(API_URL + '/api/stores?plz=' + plz + '&shop=' + encodeURIComponent(beer.shop) + '&radius=' + radius)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) throw new Error(data.error);
+        setStores(data.stores);
+      })
+      .catch(e => setError(e.message || 'Verbindungsfehler'))
+      .finally(() => setLoading(false));
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-end justify-center z-50 p-4"
+         onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-white rounded-3xl w-full max-w-sm shadow-2xl flex flex-col"
+           style={{maxHeight:'88vh'}}>
+
+        {/* Header */}
+        <div className="p-5 pb-4 border-b border-gray-100 flex-shrink-0">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <svg className="w-5 h-5 text-amber-500" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+              </svg>
+              <h3 className="font-bold text-gray-800">Filialen in der Nähe</h3>
+            </div>
+            <button onClick={onClose}
+                    className="p-1.5 rounded-xl hover:bg-gray-100 text-gray-400">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                <path d="M18 6 6 18M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${beer.shop === 'Coop' ? 'badge-coop' : 'badge-denner'}`}>{beer.shop}</span>
+            <p className="text-xs text-gray-500 truncate">{beer.name}</p>
+          </div>
+        </div>
+
+        {/* Search controls */}
+        <div className="p-4 border-b border-gray-100 flex-shrink-0">
+          <div className="flex gap-2 mb-3">
+            <input type="text" inputMode="numeric" value={plz}
+                   onChange={e => setPlz(e.target.value.replace(/\D/g,'').slice(0,4))}
+                   onKeyDown={e => e.key === 'Enter' && plz.length === 4 && search()}
+                   placeholder="PLZ (z.B. 8001)"
+                   className="flex-1 border border-gray-200 rounded-xl px-4 py-2.5 text-base font-mono tracking-widest text-center focus:outline-none focus:ring-2 focus:ring-amber-300" />
+            <button onClick={search}
+                    disabled={loading || plz.length !== 4}
+                    className="px-4 py-2.5 bg-amber-500 text-white rounded-xl font-semibold text-sm hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed min-w-[72px]">
+              {loading ? '…' : 'Suchen'}
+            </button>
+          </div>
+          <div className="flex gap-1.5">
+            {[5, 10, 20, 50].map(r => (
+              <button key={r} onClick={() => setRadius(r)}
+                      className={`flex-1 py-1.5 rounded-xl text-xs font-semibold transition-colors ${radius === r ? 'bg-amber-500 text-white shadow-sm' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}>
+                {r} km
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Results */}
+        <div className="flex-1 overflow-y-auto p-4 min-h-0">
+          {error && (
+            <div className="text-center py-6">
+              <div className="text-3xl mb-2">⚠️</div>
+              <p className="text-sm text-red-500">{error}</p>
+            </div>
+          )}
+          {!error && stores === null && (
+            <div className="text-center py-10 text-gray-400">
+              <svg className="w-12 h-12 mx-auto mb-3 text-gray-200" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+              </svg>
+              <p className="text-sm font-medium">Postleitzahl eingeben</p>
+              <p className="text-xs mt-1">und nächste {beer.shop}-Filialen finden</p>
+            </div>
+          )}
+          {!error && stores !== null && stores.length === 0 && (
+            <div className="text-center py-10 text-gray-400">
+              <div className="text-4xl mb-3">🔍</div>
+              <p className="text-sm font-medium">Keine Filialen gefunden</p>
+              <p className="text-xs mt-1">Radius auf 50 km erhöhen?</p>
+            </div>
+          )}
+          {stores && stores.length > 0 && (
+            <div className="flex flex-col gap-3">
+              <div>
+                <p className="text-xs text-gray-400 font-medium">
+                  {stores.length} Filiale{stores.length !== 1 ? 'n' : ''} im Umkreis von {radius} km
+                </p>
+                <p className="text-xs text-amber-600 font-medium mt-0.5">
+                  Verfügbar bei allen {beer.shop}-Filialen in deinem Umkreis
+                </p>
+              </div>
+              {stores.map(s => (
+                <div key={s.id} className="bg-gray-50 rounded-2xl p-3.5 border border-gray-100">
+                  <div className="flex items-start gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-sm text-gray-800 leading-snug">{s.name}</p>
+                      <p className="text-xs text-gray-500 mt-0.5">{s.address}</p>
+                      <p className="text-xs text-gray-500">{s.plz} {s.city}</p>
+                      {s.hours && (
+                        <p className="text-xs text-gray-400 mt-1.5 flex items-center gap-1">
+                          <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                          </svg>
+                          {s.hours}
+                        </p>
+                      )}
+                      {s.phone && (
+                        <a href={'tel:' + s.phone.replace(/\s/g,'')}
+                           onClick={e => e.stopPropagation()}
+                           className="text-xs text-gray-400 mt-0.5 flex items-center gap-1 hover:text-amber-600">
+                          <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.6 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 9.91a16 16 0 0 0 6.06 6.06l.91-.91a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
+                          </svg>
+                          {s.phone}
+                        </a>
+                      )}
+                    </div>
+                    <div className="flex-shrink-0 flex flex-col items-end gap-2">
+                      <span className={`text-xs font-bold px-2.5 py-1 rounded-xl ${s.distance <= 2 ? 'bg-green-100 text-green-700' : s.distance <= 10 ? 'bg-amber-50 text-amber-700' : 'bg-gray-100 text-gray-600'}`}>
+                        {s.distance} km
+                      </span>
+                    </div>
+                  </div>
+                  <a href={'https://maps.google.com/?q=' + encodeURIComponent(s.name + ', ' + s.address + ', ' + s.plz + ' ' + s.city + ', Schweiz')}
+                     target="_blank" rel="noopener noreferrer"
+                     onClick={e => e.stopPropagation()}
+                     className="mt-2.5 flex items-center gap-1.5 text-xs text-blue-500 hover:text-blue-700 font-medium">
+                    <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+                    </svg>
+                    In Google Maps öffnen
+                  </a>
+                </div>
+              ))}
+              <p className="text-xs text-gray-400 text-center mt-1 italic">
+                Verfügbarkeit basiert auf aktuellen Promotionsangeboten
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AlarmModal({ beer, existing, onSave, onClose }) {
+  const [target, setTarget] = useState(existing?.target_price ?? beer.price);
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-end justify-center z-50 p-4"
+         onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl">
+        <div className="flex items-center gap-3 mb-5">
+          <span className="text-3xl">🍺</span>
+          <div>
+            <p className="text-xs text-gray-400">{beer.brand}</p>
+            <h3 className="font-bold text-gray-800 text-sm">{beer.name}</h3>
+          </div>
+        </div>
+        <p className="text-sm text-gray-500 mb-1">Aktueller Preis: <strong className="text-amber-600">CHF {beer.price.toFixed(2)}</strong></p>
+        <label className="block text-sm font-medium text-gray-700 mt-4 mb-2">
+          Alarm bei: <span className="text-amber-600 font-bold">CHF {parseFloat(target).toFixed(2)}</span>
+        </label>
+        <input type="range"
+               min={(beer.price * 0.5).toFixed(2)}
+               max={(beer.orig_price || beer.price * 1.3).toFixed(2)}
+               step="0.05"
+               value={target}
+               onChange={e => setTarget(e.target.value)}
+               className="w-full accent-amber-500" />
+        <div className="flex gap-3 mt-6">
+          <button onClick={onClose}
+                  className="flex-1 py-3 rounded-2xl border border-gray-200 text-gray-600 font-medium hover:bg-gray-50">
+            Abbrechen
+          </button>
+          <button onClick={() => onSave(parseFloat(target))}
+                  className="flex-1 py-3 rounded-2xl bg-amber-500 text-white font-bold hover:bg-amber-600 shadow-sm">
+            {existing ? 'Aktualisieren' : 'Alarm erstellen'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ToastContainer({ toasts }) {
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-xs">
+      {toasts.map(t => (
+        <div key={t.id}
+             className={'bg-white rounded-2xl shadow-lg border-l-4 border-green-500 p-4 ' + (t.exiting ? 'toast-out' : 'toast-in')}>
+          <p className="font-bold text-sm text-green-700">🔔 Preisalarm!</p>
+          <p className="text-sm text-gray-700 mt-0.5">{t.alarm.beer_name}</p>
+          <p className="text-xs text-gray-500 mt-1">
+            Jetzt <strong className="text-green-600">CHF {t.alarm.current_price?.toFixed(2)}</strong>
+            {' '}— Ziel CHF {t.alarm.target_price?.toFixed(2)}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Tab: Home ───────────────────────────────────────────────────────────────
+function HomeTab({ beers, alarms, favorites, status, lastSync, loggedIn, user, onToggleFav, onOpenAlarm, onRefresh, onOpenLocator, onOpenAuth, onLogout }) {
+  const [search,     setSearch]     = useState('');
+  const [typeFilter, setTypeFilter] = useState('Alle');
+  const [shopFilter, setShopFilter] = useState('Alle');
+  const [sort,       setSort]       = useState('discount');
+
+  const alarmMap = useMemo(() => {
+    const m = new Map();
+    alarms.forEach(a => m.set(a.beer_id, a));
+    return m;
+  }, [alarms]);
+
+  const filtered = useMemo(() => {
+    let res = beers;
+    if (search)              res = res.filter(b => b.name.toLowerCase().includes(search.toLowerCase()) || (b.brand ?? '').toLowerCase().includes(search.toLowerCase()));
+    if (typeFilter !== 'Alle') res = res.filter(b => b.type === typeFilter);
+    if (shopFilter !== 'Alle') res = res.filter(b => b.shop === shopFilter);
+    if (sort === 'cheapest')   return [...res].sort((a, b) => {
+      const lpA = literpreis(a.price, a.volume) ?? Infinity;
+      const lpB = literpreis(b.price, b.volume) ?? Infinity;
+      return lpA - lpB;
+    });
+    if (sort === 'discount')   return [...res].sort((a, b) => (b.discount_pct ?? 0) - (a.discount_pct ?? 0));
+    if (sort === 'default')    return [...res].sort((a, b) => {
+      const favDiff = (b.fav_count ?? 0) - (a.fav_count ?? 0);
+      if (favDiff !== 0) return favDiff;
+      return (b.discount_pct ?? 0) - (a.discount_pct ?? 0);
+    });
+    return res;
+  }, [beers, search, typeFilter, shopFilter, sort]);
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Header */}
+      <div className="bg-amber-500 -mx-4 -mt-4 px-4 pt-10 pb-6">
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-white text-2xl font-black">🍺 BierDeal</h1>
+            <p className="text-amber-100 text-sm">Coop & Denner Bier-Angebote</p>
+          </div>
+          <div className="flex flex-col items-end gap-1">
+            <StatusDot status={status} />
+            {lastSync && (
+              <p className="text-xs text-amber-200">
+                {lastSync.toLocaleTimeString('de-CH', { hour: '2-digit', minute: '2-digit' })}
+              </p>
+            )}
+            <button onClick={onRefresh}
+                    className="text-xs bg-white/20 text-white px-2 py-1 rounded-lg hover:bg-white/30 mt-1">
+              ↻ Aktualisieren
+            </button>
+            {/* Auth button */}
+            {loggedIn ? (
+              <div className="flex items-center gap-1 mt-1">
+                <span className="text-xs text-white bg-white/20 px-2 py-1 rounded-lg">
+                  👤 {user?.username || user?.email || 'Konto'}
+                </span>
+                <button onClick={onLogout}
+                        className="text-xs bg-white/20 text-white px-2 py-1 rounded-lg hover:bg-white/30">
+                  Logout
+                </button>
+              </div>
+            ) : (
+              <button onClick={onOpenAuth}
+                      className="text-xs bg-white/20 text-white px-2 py-1 rounded-lg hover:bg-white/30 mt-1">
+                👤 Login
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="mt-3 relative">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
+               fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input value={search} onChange={e => setSearch(e.target.value)}
+                 placeholder="Bier oder Marke suchen…"
+                 className="w-full pl-9 pr-4 py-2.5 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+        </div>
+      </div>
+
+      {/* Type filter chips */}
+      <div className="flex gap-2 overflow-x-auto pb-1" style={{scrollbarWidth:'none'}}>
+        {BEER_TYPES.map(t => (
+          <button key={t} onClick={() => setTypeFilter(t)}
+                  className={'flex-shrink-0 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ' + (typeFilter === t ? 'bg-amber-500 text-white' : 'bg-white text-gray-600 border border-gray-200')}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {/* Shop + sort row */}
+      <div className="flex gap-2 items-center">
+        {SHOPS.map(s => (
+          <button key={s} onClick={() => setShopFilter(s)}
+                  className={'flex-shrink-0 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ' + (shopFilter === s ? 'bg-gray-800 text-white' : 'bg-white text-gray-600 border border-gray-200')}>
+            {s}
+          </button>
+        ))}
+        <div className="flex-1" />
+        <select value={sort} onChange={e => setSort(e.target.value)}
+                className="text-sm border border-gray-200 rounded-xl px-3 py-1.5 bg-white text-gray-600 focus:outline-none">
+          <option value="discount">Meisten Rabatt</option>
+          <option value="cheapest">Günstigster Liter</option>
+          <option value="default">Beliebteste</option>
+        </select>
+      </div>
+
+      {/* Results */}
+      <p className="text-xs text-gray-400">{filtered.length} Angebote</p>
+
+      {status === 'connecting' && beers.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <div className="text-4xl mb-3 animate-spin">⏳</div>
+          <p className="font-medium">Verbinde mit Backend…</p>
+          <p className="text-sm mt-1">Backend starten: <code className="bg-gray-100 px-2 py-0.5 rounded text-xs">node backend/server.js</code></p>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <div className="text-5xl mb-3">🔍</div>
+          <p>Keine Ergebnisse</p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3 pb-4">
+          {filtered.map(b => (
+            <BeerCard key={b.id} beer={b}
+                      isFav={favorites.has(b.id)}
+                      alarm={alarmMap.get(b.id)}
+                      loggedIn={loggedIn}
+                      onToggleFav={() => onToggleFav(b)}
+                      onOpenAlarm={() => onOpenAlarm(b)}
+                      onOpenLocator={onOpenLocator} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Tab: Favoriten ──────────────────────────────────────────────────────────
+function FavoritesTab({ beers, alarms, favorites, loggedIn, onToggleFav, onOpenAlarm, onOpenLocator }) {
+  const alarmMap = useMemo(() => { const m = new Map(); alarms.forEach(a => m.set(a.beer_id, a)); return m; }, [alarms]);
+  const favBeers = beers.filter(b => favorites.has(b.id));
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="pt-8 pb-2">
+        <h2 className="text-xl font-black text-gray-800">❤️ Favoriten</h2>
+        <p className="text-sm text-gray-400">{favBeers.length} gespeicherte Biere</p>
+      </div>
+      {favBeers.length === 0 ? (
+        <div className="text-center py-24 text-gray-400">
+          <div className="text-6xl mb-4">🍺</div>
+          <p className="font-medium">Noch keine Favoriten</p>
+          <p className="text-sm mt-1">Herz-Icon beim Bier antippen</p>
+          {!loggedIn && (
+            <p className="text-xs mt-2 text-amber-500">🔒 Anmelden zum dauerhaften Speichern</p>
+          )}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3 pb-4">
+          {favBeers.map(b => (
+            <BeerCard key={b.id} beer={b}
+                      isFav={true}
+                      alarm={alarmMap.get(b.id)}
+                      loggedIn={loggedIn}
+                      onToggleFav={() => onToggleFav(b)}
+                      onOpenAlarm={() => onOpenAlarm(b)}
+                      onOpenLocator={onOpenLocator} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Tab: Preisalarme ────────────────────────────────────────────────────────
+function AlarmsTab({ beers, alarms, onDeleteAlarm, onOpenAlarm }) {
+  const beerMap = useMemo(() => { const m = new Map(); beers.forEach(b => m.set(b.id, b)); return m; }, [beers]);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="pt-8 pb-2">
+        <h2 className="text-xl font-black text-gray-800">🔔 Preisalarme</h2>
+        <p className="text-sm text-gray-400">{alarms.length} aktive Alarme</p>
+      </div>
+      {alarms.length === 0 ? (
+        <div className="text-center py-24 text-gray-400">
+          <div className="text-6xl mb-4">🔕</div>
+          <p className="font-medium">Keine Preisalarme</p>
+          <p className="text-sm mt-1">Glocken-Icon beim Bier antippen</p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3 pb-4">
+          {alarms.map(a => {
+            const beer    = beerMap.get(a.beer_id);
+            const reached = a.current_price <= a.target_price;
+            return (
+              <div key={a.id} className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex gap-3">
+                <div className="text-3xl flex items-center justify-center w-14 h-14 bg-amber-50 rounded-xl flex-shrink-0">
+                  🍺
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-gray-400 truncate">{a.shop}</p>
+                  <h3 className="font-semibold text-sm text-gray-800 leading-tight">{a.beer_name}</h3>
+                  <div className="flex items-center gap-3 mt-2 flex-wrap">
+                    <div>
+                      <p className="text-xs text-gray-400">Zielpreis</p>
+                      <p className="font-bold text-amber-600">CHF {a.target_price.toFixed(2)}</p>
+                    </div>
+                    <div className="w-px h-8 bg-gray-100" />
+                    <div>
+                      <p className="text-xs text-gray-400">Aktuell</p>
+                      <p className={'font-bold ' + (reached ? 'text-green-600' : 'text-gray-700')}>
+                        CHF {a.current_price.toFixed(2)}
+                      </p>
+                    </div>
+                    {reached && (
+                      <span className="text-xs font-bold text-green-600 bg-green-50 px-2 py-0.5 rounded-full">✓ Erreicht!</span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1 flex-shrink-0">
+                  {beer && (
+                    <button onClick={() => onOpenAlarm(beer)}
+                            className="p-1.5 rounded-xl hover:bg-amber-50 text-amber-500">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                      </svg>
+                    </button>
+                  )}
+                  <button onClick={() => onDeleteAlarm(a.id)}
+                          className="p-1.5 rounded-xl hover:bg-red-50 text-red-400">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                      <polyline points="3 6 5 6 21 6"/>
+                      <path d="M19 6l-1 14H6L5 6M10 11v6M14 11v6M9 6V4h6v2"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App root ────────────────────────────────────────────────────────────────
+function App() {
+  const [tab,          setTab]          = useState('home');
+  const [favorites,    setFavorites]    = useState(new Set());
+  const [alarmModal,   setAlarmModal]   = useState(null);
+  const [locatorBeer,  setLocatorBeer]  = useState(null);
+  const [authOpen,     setAuthOpen]     = useState(false);
+  const [token,        setToken]        = useState(null);
+  const [user,         setUser]         = useState(null);
+
+  const { beers, alarms, status, toasts, lastSync, addAlarm, removeAlarm, refresh } = useWebSocket(WS_URL);
+
+  const loggedIn = !!token;
+
+  // ── Restore session on mount ──────────────────────────────────────────────
+  useEffect(() => {
+    const saved = localStorage.getItem('bierdeal_token');
+    if (!saved) return;
+    fetch(API_URL + '/api/auth/me', {
+      headers: { 'Authorization': 'Bearer ' + saved }
+    })
+      .then(r => {
+        if (!r.ok) throw new Error('Ungültig');
+        return r.json();
+      })
+      .then(data => {
+        setToken(saved);
+        setUser(data.user || data);
+        // Load persisted favorite IDs
+        return fetch(API_URL + '/api/favorites/ids', {
+          headers: { 'Authorization': 'Bearer ' + saved }
+        });
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.ids) setFavorites(new Set(data.ids));
+      })
+      .catch(() => {
+        localStorage.removeItem('bierdeal_token');
+      });
+  }, []);
+
+  // ── Handle login ──────────────────────────────────────────────────────────
+  function handleLogin(newToken, newUser) {
+    setToken(newToken);
+    setUser(newUser);
+    // Fetch persisted favorites for the newly logged in user
+    fetch(API_URL + '/api/favorites/ids', {
+      headers: { 'Authorization': 'Bearer ' + newToken }
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.ids) setFavorites(new Set(data.ids));
+      })
+      .catch(() => {});
+  }
+
+  // ── Handle logout ─────────────────────────────────────────────────────────
+  function handleLogout() {
+    setToken(null);
+    setUser(null);
+    setFavorites(new Set());
+    localStorage.removeItem('bierdeal_token');
+  }
+
+  // ── Toggle favorite ───────────────────────────────────────────────────────
+  const toggleFav = useCallback((beer) => {
+    const id = beer.id;
+    const isCurrentlyFav = favorites.has(id);
+
+    // Optimistic update always
+    setFavorites(prev => {
+      const next = new Set(prev);
+      isCurrentlyFav ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+    if (loggedIn) {
+      const method = isCurrentlyFav ? 'DELETE' : 'POST';
+      fetch(API_URL + '/api/favorites/' + id, {
+        method: method,
+        headers: { 'Authorization': 'Bearer ' + token }
+      })
+        .then(r => {
+          if (!r.ok) throw new Error('Fehler');
+        })
+        .catch(() => {
+          // Revert on failure
+          setFavorites(prev => {
+            const next = new Set(prev);
+            isCurrentlyFav ? next.add(id) : next.delete(id);
+            return next;
+          });
+        });
+    }
+  }, [favorites, loggedIn, token]);
+
+  const openAlarm    = useCallback(beer => setAlarmModal(beer), []);
+  const closeAlarm   = useCallback(() => setAlarmModal(null), []);
+  const openLocator  = useCallback(beer => setLocatorBeer(beer), []);
+  const closeLocator = useCallback(() => setLocatorBeer(null), []);
+
+  const saveAlarm = useCallback((target) => {
+    const existing = alarms.find(a => a.beer_id === alarmModal.id);
+    if (existing) removeAlarm(existing.id);
+    addAlarm(alarmModal.id, target);
+    closeAlarm();
+  }, [alarmModal, alarms, addAlarm, removeAlarm, closeAlarm]);
+
+  const navTabs = [
+    { id: 'home',      icon: '🏠', label: 'Home' },
+    { id: 'favorites', icon: '❤️',  label: 'Favoriten' },
+    { id: 'alarms',    icon: '🔔', label: 'Preisalarm' },
+  ];
+
+  return (
+    <div className="min-h-screen max-w-md mx-auto relative">
+      <div className="px-4 pt-4 pb-24 min-h-screen">
+        {tab === 'home' && (
+          <HomeTab beers={beers} alarms={alarms} favorites={favorites}
+                   status={status} lastSync={lastSync}
+                   loggedIn={loggedIn} user={user}
+                   onToggleFav={toggleFav} onOpenAlarm={openAlarm} onRefresh={refresh}
+                   onOpenLocator={openLocator}
+                   onOpenAuth={() => setAuthOpen(true)}
+                   onLogout={handleLogout} />
+        )}
+        {tab === 'favorites' && (
+          <FavoritesTab beers={beers} alarms={alarms} favorites={favorites}
+                        loggedIn={loggedIn}
+                        onToggleFav={toggleFav} onOpenAlarm={openAlarm}
+                        onOpenLocator={openLocator} />
+        )}
+        {tab === 'alarms' && (
+          <AlarmsTab beers={beers} alarms={alarms}
+                     onDeleteAlarm={removeAlarm} onOpenAlarm={openAlarm} />
+        )}
+      </div>
+
+      {/* Bottom navigation */}
+      <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md bg-white border-t border-gray-100 shadow-lg flex">
+        {navTabs.map(t => {
+          const badge = t.id === 'alarms' ? alarms.filter(a => a.current_price <= a.target_price && !a.notified).length : 0;
+          return (
+            <button key={t.id} onClick={() => setTab(t.id)}
+                    className={'flex-1 flex flex-col items-center gap-0.5 py-3 transition-colors relative ' + (tab === t.id ? 'text-amber-500' : 'text-gray-400')}>
+              <span className="text-xl leading-none">{t.icon}</span>
+              <span className="text-xs font-medium">{t.label}</span>
+              {tab === t.id && <span className="absolute bottom-1 w-1 h-1 rounded-full bg-amber-500" />}
+              {badge > 0 && (
+                <span className="absolute top-2 right-1/4 w-4 h-4 bg-red-500 text-white text-xs rounded-full flex items-center justify-center font-bold">
+                  {badge}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* Auth modal */}
+      {authOpen && (
+        <AuthModal onClose={() => setAuthOpen(false)} onLogin={handleLogin} />
+      )}
+
+      {/* Alarm modal */}
+      {alarmModal && (
+        <AlarmModal beer={alarmModal}
+                    existing={alarms.find(a => a.beer_id === alarmModal.id)}
+                    onSave={saveAlarm}
+                    onClose={closeAlarm} />
+      )}
+
+      {/* Store Locator modal */}
+      {locatorBeer && (
+        <StoreLocator beer={locatorBeer} onClose={closeLocator} />
+      )}
+
+      {/* Toast notifications */}
+      <ToastContainer toasts={toasts} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
