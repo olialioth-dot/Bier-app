@@ -250,7 +250,7 @@ function AuthModal({ onClose, onLogin }) {
         {/* Header */}
         <div className="bg-amber-500 px-6 pt-6 pb-4">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-white font-black text-xl">🍺 BierDeal</h2>
+            <h2 className="text-white font-black text-xl">BierDeal</h2>
             <button onClick={onClose}
                     className="p-1.5 rounded-xl bg-white/20 text-white hover:bg-white/30">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -729,7 +729,7 @@ function HomeTab({ beers, alarms, favorites, status, lastSync, loggedIn, user, o
       <div className="bg-amber-500 -mx-4 -mt-4 px-4 pt-10 pb-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-white text-2xl font-black">🍺 BierDeal</h1>
+            <h1 className="text-white text-2xl font-black">BierDeal</h1>
             <p className="text-amber-100 text-sm">Coop & Denner Bier-Angebote</p>
           </div>
           <div className="flex flex-col items-end gap-1">
@@ -838,12 +838,12 @@ function FavoritesTab({ beers, alarms, favorites, loggedIn, onToggleFav, onOpenA
   return (
     <div className="flex flex-col gap-4">
       <div className="pt-8 pb-2">
-        <h2 className="text-xl font-black text-gray-800">❤️ Favoriten</h2>
+        <h2 className="text-xl font-black text-gray-800">Favoriten</h2>
         <p className="text-sm text-gray-400">{favBeers.length} gespeicherte Biere</p>
       </div>
       {favBeers.length === 0 ? (
         <div className="text-center py-24 text-gray-400">
-          <div className="text-6xl mb-4">🍺</div>
+          <div className="text-6xl mb-4">📝</div>
           <p className="font-medium">Noch keine Favoriten</p>
           <p className="text-sm mt-1">Herz-Icon beim Bier antippen</p>
           {!loggedIn && (
@@ -874,12 +874,12 @@ function AlarmsTab({ beers, alarms, onDeleteAlarm, onOpenAlarm }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="pt-8 pb-2">
-        <h2 className="text-xl font-black text-gray-800">🔔 Preisalarme</h2>
+        <h2 className="text-xl font-black text-gray-800">Preisalarme</h2>
         <p className="text-sm text-gray-400">{alarms.length} aktive Alarme</p>
       </div>
       {alarms.length === 0 ? (
         <div className="text-center py-24 text-gray-400">
-          <div className="text-6xl mb-4">🔕</div>
+          <div className="text-6xl mb-4">🔇</div>
           <p className="font-medium">Keine Preisalarme</p>
           <p className="text-sm mt-1">Glocken-Icon beim Bier antippen</p>
         </div>
@@ -1051,7 +1051,7 @@ function App() {
 
   const navTabs = [
     { id: 'home',      icon: '🏠', label: 'Home' },
-    { id: 'favorites', icon: '❤️',  label: 'Favoriten' },
+    { id: 'favorites', icon: '♥',  label: 'Favoriten' },
     { id: 'alarms',    icon: '🔔', label: 'Preisalarm' },
   ];
 
