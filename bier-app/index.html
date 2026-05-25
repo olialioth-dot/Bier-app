@@ -729,7 +729,10 @@ function HomeTab({ beers, alarms, favorites, status, lastSync, loggedIn, user, o
       <div className="bg-amber-500 -mx-4 -mt-4 px-4 pt-10 pb-6">
         <div className="flex items-start justify-between">
           <div>
-            <h1 className="text-white text-2xl font-black">BierDeal</h1>
+            <div className="flex items-baseline gap-2">
+              <h1 className="text-white text-2xl font-black">Prost</h1>
+              {loggedIn && user && <p className="text-amber-100 text-sm">{user?.username || user?.email}</p>}
+            </div>
             <p className="text-amber-100 text-sm">Coop & Denner Bier-Angebote</p>
           </div>
           <div className="flex flex-col items-end gap-1">
